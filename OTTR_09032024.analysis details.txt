@@ -1,0 +1,893 @@
+
+
+## download mature human miRNA from mirBase (v22.1)
+wget https://www.mirbase.org/download/CURRENT/mature.fa
+
+mv mature.fa  mirbase22.1_mature.fa
+
+## 2656 mature miRNA
+grep -A 1 '^>hsa'  mirbase22.1_mature.fa |grep -v '^--' | perl -p -e 's{(>[^\s]+).+}{$1}' | \
+          perl -p -e 'tr/U/T/' > mirbase22.1.human.mature.mir.fa
+
+
+## download cdna fasta from Ensembl T2T rapid release
+wget https://ftp.ensembl.org/pub/rapid-release/species/Homo_sapiens/GCA_009914755.4/ensembl/genome/Homo_sapiens-GCA_009914755.4-unmasked.fa.gz
+mv Homo_sapiens-GCA_009914755.4-unmasked.fa.gz Homo_sapiens-GCA_009914755.4-T2T-unmasked.fa.gz
+
+
+wget https://ftp.ensembl.org/pub/rapid-release/species/Homo_sapiens/GCA_009914755.4/ensembl/geneset/2022_07/Homo_sapiens-GCA_009914755.4-2022_07-genes.gtf.gz
+wget https://ftp.ensembl.org/pub/rapid-release/species/Homo_sapiens/GCA_009914755.4/ensembl/geneset/2022_07/Homo_sapiens-GCA_009914755.4-2022_07-cdna.fa.gz
+
+less Homo_sapiens-GCA_009914755.4-2022_07-cdna.fa.gz | grep '^>' | \
+          grep -v 'miRNA' | perl -p -e 's{>([^ ]+).+}{$1}' > non-mirna.tx.list
+		  
+less Homo_sapiens-GCA_009914755.4-2022_07-cdna.fa.gz | grep '^>' | \
+          grep 'miRNA' | perl -p -e 's{>([^ ]+).+}{$1}' > mirna.tx.list
+		  
+
+module load seqtk
+
+seqtk subseq <(zcat Homo_sapiens-GCA_009914755.4-2022_07-cdna.fa.gz)  non-mirna.tx.list | \
+          perl -p -e 's{(>[^ ]+?.\d+).+}{$1}' > human.T2T.non-mirna.fa
+		  
+
+#### preprocessing reads
+1. trimming adapter and polyG using python regex
+import gzip
+import sys
+import regex
+import os
+
+read1=sys.argv[1]
+read2=sys.argv[2]
+sample_name = sys.argv[3]
+out_dir = sys.argv[4]
+R1_adapter=  regex.compile(r'(^.+?)(AGATCGGAAGAGC)')
+R1_adapter2= regex.compile(r'(^.+?)(AGATCGGAAGAGC){s<=3,i<=1,d<=1}')
+
+polyG = regex.compile(r'(G{15}){s<=1}')
+out_R1_f = gzip.open(os.path.join(out_dir, sample_name + "trimmed_1.fq.gz"), "at")
+out_R2_f = gzip.open(os.path.join(out_dir, sample_name + "trimmed_2.fq.gz"), "at")
+
+def read_one_read_from_fastq(file_handle):
+    name = file_handle.readline().strip()
+    seq = file_handle.readline().strip()
+    file_handle.readline()
+    quality = file_handle.readline().strip()
+    return name,seq,quality
+
+with gzip.open(read1,'rt') as r1_f, gzip.open(read2, 'rt') as r2_f:
+    # read 1 first read
+    (name_1, seq_1, quality_1) = read_one_read_from_fastq(r1_f)
+    # read 1 first read
+    (name_2, seq_2, quality_2) = read_one_read_from_fastq(r2_f)
+    while name_1 and name_2:
+        read1_g_match = polyG.search(seq_1)
+        if read1_g_match:
+            seq_1 = seq_1[:read1_g_match.start(1)]
+            quality_1 = quality_1[:read1_g_match.start(1)]
+
+        read1_seq_m = R1_adapter.search(seq_1)
+        if read1_seq_m:
+            seq_1 = read1_seq_m.group(1)
+            quality_1 = quality_1[:read1_seq_m.start(2)]
+        else:
+            read1_seq_m = R1_adapter2.search(seq_1)
+            if read1_seq_m:
+                seq_1 = read1_seq_m.group(1)
+                quality_1 = quality_1[:read1_seq_m.start(2)]
+
+        assert len(seq_1) == len(quality_1), f'{seq_1} and {quality_1} have different lengths for {name_1}.'
+        out_R1_f.writelines([name_1 + "\n", seq_1 + "\n", "+\n", quality_1+ "\n"])
+
+        read2_g_match = polyG.search(seq_2)
+        if read2_g_match:
+            seq_2 = seq_2[:read2_g_match.start(1)]
+            quality_2 = quality_2[:read2_g_match.start(1)]
+
+        read2_seq_m = R1_adapter.search(seq_2)
+        if read2_seq_m:
+            seq_2 = read2_seq_m.group(1)
+            quality_2 = quality_2[:read2_seq_m.start(2)]
+        else:
+            read2_seq_m = R1_adapter2.search(seq_2)
+            if read2_seq_m:
+                seq_2 = read2_seq_m.group(1)
+                quality_2 = quality_2[:read2_seq_m.start(2)]
+
+        assert len(seq_2) == len(quality_2), f'{seq_2} and {quality_2} have different lengths for {name_2}.'
+        out_R2_f.writelines([name_2 + "\n", seq_2 + "\n", "+\n", quality_2 + "\n"])
+
+        # read 1 first read
+        (name_1, seq_1, quality_1) = read_one_read_from_fastq(r1_f)
+        # read 1 first read
+        (name_2, seq_2, quality_2) = read_one_read_from_fastq(r2_f)
+        #print(name_2)
+# close file handles
+out_R1_f.close()
+out_R2_f.close()
+
+
+#!/bin/bash
+
+#BSUB -n 8  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=4000] # ask for memory 5G
+#BSUB -W 4:00 #limit the job to be finished in 12 hours
+#BSUB -J "fastQC[2-6]"
+#BSUB -q short   # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+###BSUB -w "done(5423513)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+
+out=regex.trimmed.data
+mkdir -p $out
+
+
+in_dir=data
+R1=(`ls ${in_dir}/*_R1_001.fastq.gz`)
+R2=(`ls ${in_dir}/*_R2_001.fastq.gz`)
+
+name=(`ls ${in_dir}/*_R1_001.fastq.gz | perl -p -e   's{.+/(.+?)_R1_001.fastq.gz}{$1}g' `)
+
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate cleanuprnaseq
+
+
+python scripts/004.regex.trim.py  ${R1[$i]} ${R2[$i]} ${name[$i]} $out
+
+
+2. merge R1 and R2 using FLASH
+#!/bin/bash
+
+#BSUB -n 4  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=4000] # ask for memory 5G
+#BSUB -W 4:00 #limit the job to be finished in 12 hours
+#BSUB -J "fastQC[3,5,6]"
+#BSUB -q short   # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+###BSUB -w "done(5423513)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+
+out=merge.data
+mkdir -p $out
+
+
+in_dir=regex.trimmed.data
+R1=(`ls ${in_dir}/*_1.fq.gz`)
+R2=(`ls ${in_dir}/*_2.fq.gz`)
+
+name=(`ls ${in_dir}/*_1.fq.gz | perl -p -e   's{.+/(.+?)_1.fq.gz}{$1}g' `)
+
+
+~/bin/FLASH-1.2.11/flash --min-overlap 8 --max-mismatch 0.25  --max-overlap 150 \
+                         -o ${name[$i]} -d $out -z  -t 4 \
+                         ${R1[$i]} ${R2[$i]}
+						 
+						 
+3. extract unmerged R1
+import gzip
+import sys
+import regex
+import os
+
+read1=sys.argv[1]
+read2=sys.argv[2]
+sample_name = sys.argv[3]
+out_dir = sys.argv[4]
+
+out_R1_f = gzip.open(os.path.join(out_dir, sample_name + "trimmed_1.fq.gz"), "at")
+#out_R2_f = gzip.open(os.path.join(out_dir, sample_name + "trimmed_2.fq.gz"), "at")
+
+def read_one_read_from_fastq(file_handle):
+    name = file_handle.readline().strip()
+    seq = file_handle.readline().strip()
+    file_handle.readline()
+    quality = file_handle.readline().strip()
+    return name,seq,quality
+
+def reverse_complement(sequence):
+    """
+    reverse complement DNA sequences
+    :param sequence: A DNA sequence
+    :return: reverse complement DNA sequence
+    """
+    sequence_1 = sequence[::-1]
+    translation_table = str.maketrans("ATCGN", "TAGCN")
+    sequence_1 = sequence_1.translate(translation_table)
+    return sequence_1
+
+with gzip.open(read1,'rt') as r1_f, gzip.open(read2, 'rt') as r2_f:
+    # read 1 first read
+    (name_1, seq_1, quality_1) = read_one_read_from_fastq(r1_f)
+    # read 1 first read
+    (name_2, seq_2, quality_2) = read_one_read_from_fastq(r2_f)
+    while name_1 and name_2:
+        if len(seq_1) >= 20 and len(seq_2) >= 20:
+            out_R1_f.writelines([name_1 + "\n", seq_1 + "\n", "+\n", quality_1 + "\n"])
+        #    out_R2_f.writelines([name_2 + "\n", seq_2 + "\n", "+\n", quality_2 + "\n"])
+        elif len(seq_1) >= 20:
+            out_R1_f.writelines([name_1 + "\n", seq_1 + "\n", "+\n", quality_1 + "\n"])
+        #elif len(seq_2) >= 20:
+        #    name_1 = regex.sub("2:N:0:", "1:N:0:", name_2)
+        #    seq_1 =  reverse_complement(seq_2)
+        #    quality_1 = quality_2[::-1]
+        #    out_R1_f.writelines([name_1 + "\n", seq_1 + "\n", "+\n", quality_1 + "\n"])
+
+        # read 1 first read
+        (name_1, seq_1, quality_1) = read_one_read_from_fastq(r1_f)
+        # read 1 first read
+        (name_2, seq_2, quality_2) = read_one_read_from_fastq(r2_f)
+        #print(name_2)
+# close file handles
+out_R1_f.close()
+out_R2_f.close()
+
+###########################################################################
+#!/bin/bash
+
+#BSUB -n 1  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=4000] # ask for memory 5G
+#BSUB -W 4:00 #limit the job to be finished in 12 hours
+#BSUB -J "fastQC[1-6]"
+#BSUB -q short   # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+###BSUB -w "done(5423513)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+
+out=filter.rev.complement.data
+mkdir -p $out
+
+
+in_dir=merge.data
+R1=(`ls ${in_dir}/*notCombined_1.fastq.gz`)
+R2=(`ls ${in_dir}/*notCombined_2.fastq.gz`)
+
+name=(`ls ${in_dir}/*notCombined_1.fastq.gz | perl -p -e   's{.+/(.+?)notCombined_1.fastq.gz}{$1}g' `)
+
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate cleanuprnaseq
+
+
+python scripts/006.filter.rev.comp.reads.py  ${R1[$i]} ${R2[$i]} ${name[$i]} $out
+
+
+4. Combine unmerged R1 with the merged R1/R2
+#!/bin/bash
+
+#BSUB -n 1  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=4000] # ask for memory 5G
+#BSUB -W 4:00 #limit the job to be finished in 12 hours
+#BSUB -J "fastQC[1-6]"
+#BSUB -q short   # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+###BSUB -w "done(5423513)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+
+out=extended.N.not.cmbed.read1.data
+mkdir -p $out
+
+collapsed_R1=(`ls merge.data/OTTR-*trimmed.extendedFrags.fastq.gz`)
+R1=(`ls  filter.rev.complement.data/*trimmed.trimmed_1.fq.gz`)
+
+
+name=(`ls filter.rev.complement.data/*trimmed.trimmed_1.fq.gz | perl -p -e   's{.+/(.+?)trimmed.trimmed_1.fq.gz}{$1}g' `)
+
+
+cat ${collapsed_R1[$i]}  ${R1[$i]} > $out/${name[$i]}_R1.fastq.gz
+
+
+5. chira collapse reads using UMI and sequences
+#!/usr/bin/env python
+from collections import defaultdict
+import argparse
+from Bio import SeqIO
+import gzip
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Chimeric Read Annotator: collapse FASTQ reads to FASTA format',
+                                     usage='%(prog)s [-h] [-v,--version]',
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    parser.add_argument('-i', '--fastq', action='store', dest='fastq', required=True, metavar='',
+                        help='Input fastq file')
+    parser.add_argument('-o', '--fasta', action='store', dest='fasta', required=True, metavar='',
+                        help='Output fasta file')
+    parser.add_argument("-u", '--umi_len', action='store', type=int, default=0, help="Length of the UMI, if present."
+                        "It is trimmed from the 5' end of each read and appended to the tag id")
+    parser.add_argument('-v', '--version', action='version', version='%(prog)s 1.4.3')
+
+    args = parser.parse_args()
+    print('Input FASTQ          : ' + args.fastq)
+    print('Output FASTA         : ' + args.fasta)
+    print('Length of the UMI    : ' + str(args.umi_len))
+
+    d_uniq_reads = defaultdict(int)
+    with gzip.open(args.fastq, "rt") as fh_fastq:
+        for record in SeqIO.parse(fh_fastq, "fastq"):
+            umi = str(record.seq)[0:args.umi_len]
+            sequence = str(record.seq)[args.umi_len:]
+            d_uniq_reads[sequence, umi] += 1
+    c = 1
+    with open(args.fasta, "w") as fh_out:
+        for sequence, umi in sorted(d_uniq_reads.keys()):
+            readcount = d_uniq_reads[sequence, umi]
+            seqid = str(c)
+            if umi:
+                seqid += "|" + umi
+            seqid += "|" + str(readcount)
+            fh_out.write(">" + seqid + "\n" + sequence + "\n")
+            c += 1
+
+###### Chira collapse based on UMI and sequence, converting fastq to fasta
+read_id|UMI|counts, like 1|ATAGCA|34
+
+
+#!/bin/bash
+
+#BSUB -n 1  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=8000] # ask for memory 5G
+#BSUB -W 24:00 #limit the job to be finished in 12 hours
+#BSUB -J "clan[1-6]"
+#BSUB -q long  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+##BSUB -w "done(857157)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+set -euo pipefail
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate chira
+
+in=extended.N.not.cmbed.read1.data
+fastq=($in/*.fastq.gz)
+name=(`ls $in/*.fastq.gz | perl -p -e 's{.+/(.+?).fastq.gz}{$1}'`)
+
+out=results/030.collapse.fasta.out
+mkdir -p $out
+
+python scripts/030.chira_collapse.py  -i ${fastq[$i]}  -o $out/${name[$i]}.fa --umi_len 6
+
+
+https://training.galaxyproject.org/training-material/topics/transcriptomics/tutorials/rna-interactome/tutorial.html
+
+
+
+#####################################################################
+#### build clan index for both miRNA and non-miRNA
+
+#!/bin/bash
+
+#BSUB -n 4  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=4000] # ask for memory 5G
+#BSUB -W 8:00 #limit the job to be finished in 12 hours
+#BSUB -J "clan[1]"
+#BSUB -q long  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+##BSUB -w "done(857157)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+source /share/pkg/miniconda3/etc/profile.d/conda.sh
+module load bowtie2/2.5.0
+module load samtools/1.16.1
+
+
+out=docs/003.T2T-non-mirna.CLAN.index
+mkdir -p $out
+fasta=docs/001.human.T2T.non-mirna.fa
+clan_index -f  $fasta  -d   $out/00.non-mirna
+
+fasta2=docs/002.mirbase22.1.human.mature.mir.fa
+out2=docs/003.human.mirBase22.1-mirna.CLAN.index
+mkdir -p $out2
+clan_index -f  $fasta2  -d   $out2/00.mirna
+
+
+
+#### Chira_map.py using CLAN as aligner doesn't work due to std::bad_alloc error.
+#### clan has memory issue. So use BWA mem
+
+#!/bin/bash
+
+#BSUB -n 1  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=8000] # ask for memory 5G
+#BSUB -W 4:00 #limit the job to be finished in 12 hours
+#BSUB -J "BWA[1]"
+#BSUB -q long  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+##BSUB -w "done(272017)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+set -euo pipefail
+
+module load bwa/0.7.17
+
+non_mir_fa=docs/001.human.T2T.non-mirna.fa
+mir_fa=docs/002.mirbase22.1.human.mature.mir.fa
+
+out=docs/003.bwa.T2T.non-mirna.index
+mkdir -p $out
+
+bwa index -p $out/00.non-mira ${non_mir_fa}
+
+out=docs/003.bwa.mirbase22.1-mirna.index
+mkdir -p $out
+
+bwa index  -p $out/00.mira ${mir_fa}
+
+
+ 
+ 
+#### Chira_map
+
+#!/bin/bash
+
+#BSUB -n 8  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=8000] # ask for memory 5G
+#BSUB -W 4:00 #limit the job to be finished in 12 hours
+#BSUB -J "clan[1-6]"
+#BSUB -q long  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+##BSUB -w "done(857157)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate chira
+
+module load samtools
+module load bwa
+
+set -euo pipefail
+
+
+
+non_mir_fa=docs/001.human.T2T.non-mirna.fa
+mir_fa=docs/002.human.T2T.mirna.fa
+
+in=results/030.collapse.fasta.out
+fasta=($in/*.fa)
+name=(`ls $in/*.fa | perl -p -e s'{.+/(.+?).fa}{$1}'`)
+
+out=results/032.clan.map.out/${name[$i]}
+mkdir -p $out
+
+
+python docs/chira/chira_map.py --aligner bwa \
+   -i ${fasta[$i]} \
+   -o $out \
+   --ref_fasta1  ${non_mir_fa} \
+   --ref_fasta2  ${mir_fa} \
+   --build \
+   -s both -p 8 -co 2
+
+
+
+
+####### Chira quantification
+
+#!/bin/bash
+
+#BSUB -n 1  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=128000] # ask for memory 5G
+#BSUB -W 72:00 #limit the job to be finished in 12 hours
+#BSUB -J "clan[1,3]"
+#BSUB -q long  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+##BSUB -w "done(857157)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+set -euo pipefail
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate chira
+
+segments_bed=(results/035.chira.merge.out/*/segments.bed)
+merged_bed=(results/035.chira.merge.out/*/merged.bed)
+name=(`ls results/035.chira.merge.out/*/segments.bed | perl -p -e 's{.+/(.+?)/segments.bed}{$1}'`)
+
+chira=docs/chira
+out=results/035.chira.quantify.out/${name[$i]}
+mkdir -p $out
+
+python $chira/chira_quantify.py --bed ${segments_bed[$i]} \
+       --merged_bed ${merged_bed[$i]} \
+       --outdir $out \
+       --min_locus_size 2 \
+       --build_crls_too
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+######## chira extract the best read mapping using EM algorithms
+######## Chira failed to get hybrid computed, but it is OK to get useful mapping and quantification information
+
+#!/bin/bash
+
+#BSUB -n 8  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=8000] # ask for memory 5G
+#BSUB -W 24:00 #limit the job to be finished in 12 hours
+#BSUB -J "clan[1,3]"
+#BSUB -q long  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+##BSUB -w "done(945503)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+set -euo pipefail
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate chira
+#module load bedtools/2.30.0
+
+crl=( results/035.chira.quantify.out/*/loci.counts)
+
+name=(`ls results/035.chira.quantify.out/*/loci.counts | perl -p -e 's{.+/.+?quantify.out/(.+?)/loci.counts}{$1}'`)
+gtf=docs/Homo_sapiens-GCA_009914755.4-2022_07-genes.sorted.gtf
+chira=docs/chira
+genome_fasta=docs/Homo_sapiens-GCA_009914755.4-T2T-unmasked.fa
+
+non_mir_fa=docs/001.human.T2T.non-mirna.fa
+mir_fa=docs/002.human.T2T.mirna.fa
+
+out=results/042.chira.extract.out/${name[$i]}
+mkdir -p $out
+
+python $chira/chira_extract.py --loci  ${crl[$i]}  \
+   --out $out \
+   --gtf  $gtf \
+   --process 8 \
+   --hybridize \
+   --accessibility  C \
+   --ref_fasta1 ${non_mir_fa} \
+   --ref_fasta2  ${mir_fa} \
+   --ref $genome_fasta \
+   --summerize
+
+
+
+
+
+#### Singleton frequency
+for f in `ls -d OTTR-*`; 
+do 
+  sort -k1,1 -u $f/singletons.* |cut -f5 |sort | \
+  uniq -c |  perl -p -e 's{\s*(\d+)\s(.+)}{$2\t$1}'  >  ${f}.singleton.stat; 
+done
+
+
+
+#### Add header to chimeras, singletons
+ for f in `ls -d OTTR*`; do  grep -h 'miRNA' $f/singletons.* | perl -p -e 'BEGIN{print "Count\tread_id\ttxid\tgeneid\tsymbol\tregion\ttx_pos_start\ttx_pos_end\ttx_pos_strand\tlength\tread_info\tgenomic_pos\tlocus\tgroupid\ttpm\tscore\n"} s{(.+?\|.+?\|(\d+).+)}{$2\t$1}' > ${f}.miRNA-only.txt; done
+ 
+
+for f in `ls -d OTTR*`; do  grep -h 'miRNA' $f/singletons.* | perl -p -e 'BEGIN{print "Count\tread_id\ttxid\tgeneid\tsymbol\tregion\ttx_pos_start\ttx_pos_end\ttx_pos_strand\tlength\tread_info\tgenomic_pos\tlocus\tgroupid\ttpm\tscore\n"} s{(.+?\|.+?\|(\d+).+)}{$2\t$1}' > mirna-only/${f}.miRNA-only.txt; done
+ 2919  [2024-09-11 13:01:41] for f in `ls -d OTTR*`; do  grep -h -v 'miRNA' $f/singletons.* | perl -p -e 'BEGIN{print "Count\tread_id\ttxid\tgeneid\tsymbol\tregion\ttx_pos_start\ttx_pos_end\ttx_pos_strand\tlength\tread_info\tgenomic_pos\tlocus\tgroupid\ttpm\tscore\n"} s{(.+?\|.+?\|(\d+).+)}{$2\t$1}' > target-only/${f}.miRNA-only.txt; done
+
+
+ for f in `ls -d OTTR-10T1_R1`; 
+ do  
+    perl -p -e 'BEGIN{print "Count\treadid\ttxid1\ttxid2\tgeneid1\tgeneid2\tsymbol1\tsymbol2\tregion1\tregion2\ttx_pos_start1\ttx_pos_end1\ttx_pos_strand1\tlength1\ttx_pos_start2\ttx_pos_end2\ttx_pos_strand2\tlength2\tread_info\tgenomic_pos1\tgenomic_pos2\tlocus1\tlocus2\tgroupid1\tgroupid2\ttpm1\ttpm2\tscore1\tscore2\tscore\tsequences\thybrid\thybrid_pos\tmfe\n"} s{(.+?\|.+?\|(\d+).+)}{$2\t$1}'  $f/chimeras.*  > chimeras/${f}.chimeras.txt; 
+	
+done
+
+
+######################## find the target biotypes by bedtools
+## target mapping genomic regions
+ for f in `ls *.txt`; do base=`basename $f .txt`; cut -f22 $f |\
+     awk 'BEGIN{FS=":"; OFS="\t"}NR > 1 {print $1, $2, $3, $1":"$2"-"$3":"$4, 10, $4}' | \
+	 sort -k1,1 -k2,2n -k3,3n -u  > target.bed/${base}.bed; done
+
+### Generate genome file from BAM file
+
+samtools view -H results/008.samtool.sort.out/OTTR-10T1.sort.bam | grep '^@SQ' |head -n 24 |\
+            perl -p -e 's{.+?SN:([^\t]+)\tLN:(\d+)}{$1\t$2}' > docs/T2T.genome.file
+
+
+
+#!/bin/bash
+
+#BSUB -n 1  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=4000] # ask for memory 5G
+#BSUB -W 8:00 #limit the job to be finished in 12 hours
+#BSUB -J "bwa[1-6]"
+#BSUB -q long  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+##BSUB -w "done(853972)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+module load bedtools
+
+in=results/042.chira.extract.out/chimeras/target.bed/
+bam=($in/*.chimeras.bed)
+gtf=docs/Homo_sapiens-GCA_009914755.4-2022_07-genes.sorted.gtf
+name=(`ls $in/*chimeras.bed | perl -p -e 's{.+/(.+?).chimeras.bed}{$1}'`)
+
+out=results/044.chimeras.gtf.intersect.out
+mkdir -p $out
+
+bedtools intersect -wao -a <(bedtools sort -g docs/T2T.genome.file -i ${bam[$i]} ) -b $gtf > $out/${name[$i]}.chimeric.intersect.gtf.txt
+
+
+######################## biotype frequency
+
+import sys
+from collections import defaultdict
+import re
+
+
+in_file = sys.argv[1]
+out_file = sys.argv[2]
+biotype_file = sys.argv[3]
+
+biotypes = []
+with open(biotype_file, "r") as biotype_h:
+    for line in biotype_h:
+        biotypes.append(line.rstrip())
+
+reads=defaultdict(list)
+n_gene_reads = 0
+n_intergenic_reads =0
+
+gene_biotype_p = re.compile(r'gene_biotype "([^"]+)')
+
+counts=defaultdict(lambda: 0)
+with open(in_file, "r") as in_h:
+    for line in in_h:
+        line_cur = line.rstrip().split("\t")
+        if len(line_cur) > 5:
+            if line_cur[8] in ["exon"]:
+                biotype = gene_biotype_p.search(line_cur[14])
+                if biotype:
+                    reads[line_cur[3]].append(biotype.group(1))
+                else:
+                    print("no biotype")
+        else:
+            if line_cur[1] in ["exon"]:
+                reads[line_cur[0]].append(line_cur[2])
+    for read in reads:
+        for bt in biotypes:
+            if bt in reads[read]:
+                counts[bt] += 1
+
+with open(out_file, "w") as out_h:
+    for bt in sorted(counts.keys()):
+        out_h.write(f'#reads mapping to {bt}\t{counts[bt]}\n')
+		
+		
+### LSF job to find frequency of biotypes
+#!/bin/bash
+
+#BSUB -n 1  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=16000] # ask for memory 5G
+#BSUB -W 8:00 #limit the job to be finished in 12 hours
+#BSUB -J "bwa[1-6]"
+#BSUB -q long  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+##BSUB -w "done(853972)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate chira
+
+in=results/044.chimeras.gtf.intersect.out
+bam=($in/*.txt)
+name=(`ls $in/*.txt | perl -p -e 's{.+/(.+?).txt}{$1}'`)
+
+out=results/044.gtf.intersect.out/001.biotype.stat
+mkdir -p $out
+
+python scripts/041.exonic.biotypes.py  ${bam[$i]}  $out/${name[$i]}.stat.txt  docs/006.human.T2T.biotypes.txt
+
+
+
+
+
+########### find CDS, 5'UTR, 3' UTR frequency
+import sys
+from collections import defaultdict
+import re
+
+in_file = sys.argv[1]
+out_file = sys.argv[2]
+reads=defaultdict(list)
+mrna_region=["CDS", "five_prime_utr", "three_prime_utr"]
+counts=defaultdict(lambda: 0)
+with open(in_file, "r") as in_h:
+    for line in in_h:
+        line_cur = line.rstrip().split("\t")
+        if len(line_cur) > 5:
+            if line_cur[8] in mrna_region:
+                reads[line_cur[3]].append(line_cur[8])
+        else:
+            if line_cur[1] in mrna_region:
+                reads[line_cur[0]].append(line_cur[1])
+    for read in reads:
+        if mrna_region[2] in reads[read]:
+            counts[mrna_region[2]] += 1
+        elif mrna_region[1] in reads[read]:
+            counts[mrna_region[1]] += 1
+        elif mrna_region[0] in reads[read]:
+            counts[mrna_region[0]] += 1
+
+with open(out_file, "w") as out_h:
+    for bt in sorted(counts.keys()):
+        out_h.write(f'#reads mapping to {bt}: {counts[bt]}\n')
+		
+
+##### LSF job scripts for finding CDS, 5' UTR 3' UTR frequency
+
+#!/bin/bash
+
+#BSUB -n 1  # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=16000] # ask for memory 5G
+#BSUB -W 8:00 #limit the job to be finished in 12 hours
+#BSUB -J "bwa[1-6]"
+#BSUB -q long  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+##BSUB -w "done(853972)"
+
+i=$(($LSB_JOBINDEX- 1))
+mkdir -p logs
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate chira
+
+
+in=results/044.chimeras.gtf.intersect.out
+bam=($in/*.txt)
+name=(`ls $in/*.txt | perl -p -e 's{.+/(.+?).txt}{$1}'`)
+
+out=results/044.gtf.intersect.out/002.mRNA.region.stat
+
+mkdir -p $out
+
+python scripts/042.mrna.region.py  ${bam[$i]}  $out/${name[$i]}.stat.txt
+
+
+
+###### using R scripts to join tables
+
+
+setwd(r"(C:\Users\liuh\OneDrive - University Of Massachusetts Medical School\Desktop\UMass_work\Paul\Hadi_clash\OTTR_09032024\Chira-stat\001.biotype.stat)")
+
+f <- dir(".", ".txt")
+names(f) <- gsub("_R1.chimeric.intersect.gtf.stat.txt", "", f)
+
+stat <- mapply(function(.x, .name)
+    {
+       dat <- read.delim(.x, sep = "\t", as.is = TRUE, header = FALSE)
+       colnames(dat) <- c("class", .name)
+       dat
+    }, f, names(f), SIMPLIFY = FALSE)
+
+library(purrr)
+library(tidyverse)
+library(openxlsx)
+stat_m <- stat %>% reduce(merge, by ="class",
+                          all= TRUE,
+                          sort = FALSE)
+
+stat_m_n <- do.call("cbind", lapply(as.data.frame(stat_m)[ ,-1], function(.x)
+    {
+       .x <- ifelse(is.na(.x), 0, .x)
+    }))
+rownames(stat_m_n) <- stat_m[, 1]
+
+write.xlsx(stat_m_n, file = "00.stat.xlsx", keepNA = TRUE,
+           rowNames = TRUE)
+
+
+setwd(r"(C:\Users\liuh\OneDrive - University Of Massachusetts Medical School\Desktop\UMass_work\Paul\Hadi_clash\OTTR_09032024\Chira-stat\002.mRNA.region.stat)")
+
+f <- dir(".", ".txt")
+names(f) <- gsub("_R1.chimeric.intersect.gtf.stat.txt", "", f)
+
+stat <- mapply(function(.x, .name)
+{
+    dat <- read.delim(.x, sep = "\t", as.is = TRUE, header = FALSE)
+    colnames(dat) <- c("class", .name)
+    dat
+}, f, names(f), SIMPLIFY = FALSE)
+
+library(purrr)
+library(tidyverse)
+library(openxlsx)
+stat_m <- stat %>% reduce(merge, by ="class",
+                          all= TRUE,
+                          sort = FALSE)
+
+stat_m_n <- do.call("cbind", lapply(as.data.frame(stat_m)[ ,-1], function(.x)
+{
+    .x <- ifelse(is.na(.x), 0, .x)
+}))
+rownames(stat_m_n) <- stat_m[, 1]
+
+write.xlsx(stat_m_n, file = "00.stat.xlsx", keepNA = TRUE,
+           rowNames = TRUE)
+		   
+		  
+
+
+
+
+
+## get mirna-target pair frequencies
+
+for f in *.txt; 
+do 
+	mkdir -p chimeric.summary; base=`basename $f .txt`; cut -f5-8 $f | \
+	tail -n +2 |sort | uniq -c | perl -p -e 'BEGIN{print "Frequency\tGeneID_1\tGeneID2\tSymbol1\tSymbol2\n"}
+	                                       s{^\s*}{};s{\s+\b}{\t}g' >   chimeric.summary/${base}.summary.txt; 
+done
+
+
+
